@@ -129,3 +129,136 @@
         (ok true)
     )
 )
+
+;; Offer loan
+(define-public (offer-loan 
+    (token-id uint)
+    (amount uint)
+    (interest-rate uint)
+    (duration uint))
+
+    (let 
+        ((listing (unwrap! (get-loan-listing token-id) ERR_NOT_LISTED))
+         (loan-id (var-get next-loan-id)))
+
+        ;; Checks
+        (asserts! (>= amount (get requested-amount listing)) ERR_INSUFFICIENT_VALUE)
+        (asserts! (>= duration (get min-duration listing)) ERR_INSUFFICIENT_VALUE)
+        (asserts! (<= interest-rate (get max-interest listing)) ERR_INSUFFICIENT_VALUE)
+
+        ;; Transfer STX to borrower
+        (try! (stx-transfer? amount tx-sender (get owner listing)))
+
+        ;; Create loan
+        (map-set loan-details
+            { loan-id: loan-id }
+            {
+                borrower: (get owner listing),
+                lender: tx-sender,
+                token-id: token-id,
+                amount: amount,
+                interest-rate: interest-rate,
+                duration: duration,
+                start-block: stacks-block-height,
+                status: u"active",
+                missed-payments: u0,
+                total-repaid: u0
+            }
+        )
+
+        ;; Link token to loan
+        (map-set token-loans { token-id: token-id } { loan-id: loan-id })
+
+        ;; Remove listing
+        (map-delete loan-listings { token-id: token-id })
+
+        ;; Transfer NFT to contract
+        (try! (nft-transfer? dynamic-nft token-id (get owner listing) (as-contract tx-sender)))
+
+        ;; Increment loan ID
+        (var-set next-loan-id (+ loan-id u1))
+        (ok loan-id)
+    )
+)
+
+;; Internal function to calculate payment
+(define-private (calculate-payment (loan (tuple (amount uint) (interest-rate uint) (duration uint) (start-block uint))))
+    (let
+        ((total-amount (* (get amount loan) (+ u100 (get interest-rate loan))))
+         (payment-per-block (/ total-amount (get duration loan))))
+        payment-per-block
+    )
+)
+
+(define-private (min-uint (a uint) (b uint))
+    (if (<= a b) a b)
+)
+
+(define-private (max-uint (a uint) (b uint))
+    (if (>= a b) a b)
+)
+
+
+;; Update NFT attributes
+(define-private (update-nft-attributes (loan-id uint) (payment uint) (payment-due uint))
+    (match (get-loan-details loan-id)
+        loan-data (match (get-token-attributes (get token-id loan-data))
+            token-data (begin
+                (map-set token-attributes
+                    { token-id: (get token-id loan-data) }
+                    (merge token-data {
+                        condition: (if (>= payment payment-due)
+                            (min-uint u100 (+ (get condition token-data) u5))
+                            (max-uint u1 (- (get condition token-data) u10))),
+                        power-level: (if (>= payment payment-due)
+                            (min-uint u100 (+ (get power-level token-data) u3))
+                            (max-uint u1 (- (get power-level token-data) u7))),
+                        last-updated: stacks-block-height
+                    })
+                )
+                (ok true))
+            ERR_NFT_NOT_FOUND)
+        ERR_LOAN_NOT_FOUND)
+)
+
+
+;; Close loan
+(define-public (close-loan (loan-id uint))
+    (let
+        ((loan (unwrap! (get-loan-details loan-id) ERR_LOAN_NOT_FOUND)))
+
+        ;; Checks
+        (asserts! (is-eq (get status loan) u"active") ERR_LOAN_CLOSED)
+        (asserts! (>= (- stacks-block-height (get start-block loan)) (get duration loan)) ERR_LOAN_NOT_DUE)
+
+        (if (>= (get total-repaid loan) (get amount loan))
+            (begin
+                ;; Return NFT to borrower
+                (try! (as-contract (nft-transfer? 
+                    dynamic-nft 
+                    (get token-id loan) 
+                    (as-contract tx-sender) 
+                    (get borrower loan))))
+
+                ;; Update loan status
+                (map-set loan-details
+                    { loan-id: loan-id }
+                    (merge loan { status: u"completed" }))
+                (ok true))
+
+            (begin
+                ;; Transfer NFT to lender
+                (try! (as-contract (nft-transfer? 
+                    dynamic-nft 
+                    (get token-id loan) 
+                    (as-contract tx-sender) 
+                    (get lender loan))))
+
+                ;; Update loan status
+                (map-set loan-details
+                    { loan-id: loan-id }
+                    (merge loan { status: u"defaulted" }))
+                (ok false))
+        )
+    )
+)
